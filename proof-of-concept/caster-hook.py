@@ -7,10 +7,10 @@
 # Mainly this should run tests for a few things:
 # - pexpect.spawn using pty
 # - pexpect.popen_spawn.PopenSpawn using pipe
+# - passing cccaster launch arguments
 # - logging ANYTHING, even raw
 # - improving logging
 # - output detection for menus
-# - sending a menu command
 # - terminating caster
 # - verify termination with psutil
 
@@ -26,7 +26,7 @@ DEFAULT_PATTERNS = ["CCCaster", "Netplay", "Spectate", "Broadcast", "Offline", "
 
 # list of possible process names
 # if we spawn caster within wine it's not guaranteed that the process is called the same as in windows so best is to cycle through a list of possible terms
-PROCESS_KEYWORDS = ["cccaster", "mbaa", "wine", "wine64", "wineserver"]
+PROCESS_KEYWORDS = ["cccaster", "mbaa", "wine", "wine64", "wineserver", "wineconsole"]
 
 # =============================================================
 # MAIN
@@ -39,7 +39,20 @@ def main() -> int:
     cwd = os.path.abspath(args.cwd)
     wine_debug = args.wine_debug if args.wine_debug != "" else None
     env = build_env(args.wine_prefix, wine_debug)
-    argv = build_argv(args.wine_cmd, args.caster_exe, args.caster_args)
+
+    # argument build based on caster arguments
+    caster_args = build_caster_args(
+        args.caster_mode,
+        port=args.port,
+        address=args.address,
+        no_ui=args.no_ui,
+        raw_args=args.caster_args
+    )
+
+    no_fork = args.no_fork or "no-fork" in args.launch_mode
+    use_wineconsole = "wineconsole" in args.launch_mode
+
+    argv = build_argv(args.wine_cmd, args.caster_exe, caster_args, no_fork=no_fork, use_wineconsole=use_wineconsole)
 
     if args.log_dir:
         logs_dir = os.path.abspath(args.log_dir)
@@ -57,7 +70,9 @@ def main() -> int:
         "cwd=%r\n" % cwd,
         "argv=%r\n" % argv,
         "WINEPREFIX=%r\n" % env.get("WINEPREFIX"),
-        "WINEDEBUG=%r\n" % env.get("WINEDEBUG")
+        "WINEDEBUG=%r\n" % env.get("WINEDEBUG"),
+        "launch_mode=%r\n" % args.launch_mode,
+        "caster_mode=%r\n" % args.caster_mode
     ]
     for msg in header_info: write_log(main_log, msg)
 
@@ -66,7 +81,7 @@ def main() -> int:
     write_log(main_log, "\n# WINE VERSION\nexit code=%r\noutput=%s\n" % (wine_version_code, wine_version_output))
 
     # requirement checks
-    errors = check_requirements(args.wine_cmd, args.caster_exe, cwd, args.backend)
+    errors = check_requirements(args.wine_cmd, args.caster_exe, cwd, args.launch_mode)
     if errors:
         write_log(main_log, "\n# REQUIREMENT ERROR\n")
         print("Requirement check failed, see log:\n%s" % main_log)
@@ -87,17 +102,19 @@ def main() -> int:
     results = {}
 
     # test pexpect.spawn (pty)
-    if args.backend in ("spawn", "both"):
+    if args.launch_mode == "spawn":
         print("Testing spawn backend...")
         results["spawn"] = test_spawn_backend(argv, cwd, env, logs_dir, DEFAULT_PATTERNS, send_key, args.read_seconds)
 
-    # diff new processes since first snapshot
-    created_after_spawn = extract_new_processes(before_processes, snapshot_processes(PROCESS_KEYWORDS))
-
     # test pexpect.popen_spawn (pipe)
-    if args.backend in ("popen", "both"):
+    elif args.launch_mode == "popen":
         print("Testing popen backend...")
         results["popen"] = test_popen_backend(argv, cwd, env, logs_dir, DEFAULT_PATTERNS, send_key, args.read_seconds)
+
+    # test subprocess.Popen
+    else:
+        print("Testing subprocess backend (%s)..." % args.launch_mode)
+        results["subprocess"] = test_subprocess_backend(argv, cwd, env, logs_dir, args.read_seconds)
 
     # diff new processes since first snapshot
     created_after_all = extract_new_processes(before_processes, snapshot_processes(PROCESS_KEYWORDS))
@@ -106,9 +123,6 @@ def main() -> int:
     write_log(main_log, "\nRESULTS\n")
     for backend, success in sorted(results.items()):
         write_log(main_log, "%s=%r\n" % (backend, success))
-
-    write_log(main_log, "\nCREATED PROCESSES AFTER SPAWN\n")
-    for row in created_after_spawn: write_log(main_log, "%r\n" % row)
 
     write_log(main_log, "\nCREATED PROCESSES AFTER ALL\n")
     for row in created_after_all: write_log(main_log, "%r\n" % row)
@@ -167,22 +181,40 @@ def build_env(wine_prefix: Optional[str], wine_debug: Optional[str]) -> Dict[str
     if wine_debug is not None: env["WINEDEBUG"] = wine_debug # sets env even if it's empty
     return env
 
-# builds a complete argument string to be passed to subprocess logic
-def build_argv(wine_cmd: str, caster_exe: str, extra_args: Sequence[str]) -> List[str]:
-    return [wine_cmd, caster_exe] + list(extra_args)
+# builds an argument string to be passed to subprocess
+def build_argv(wine_cmd: str, caster_exe: str, caster_args: Sequence[str], no_fork: bool = False, use_wineconsole: bool = False) -> List[str]:
+    if use_wineconsole: argv = ["wineconsole", caster_exe]
+    else: argv = [wine_cmd, caster_exe]
+    if no_fork: argv.append("--no-fork")
+    argv.extend(caster_args)
+    return argv
+
+def build_caster_args(mode: str, port: str = "12345", address: str = "127.0.0.1", no_ui: bool = False, raw_args: Sequence[str] = []) -> List[str]:
+    args = []
+    if no_ui: args.append("-n")
+
+    if mode == "offline-training": args.extend(["-o", "-t"])
+    elif mode == "offline-versus": args.append("-o")
+    elif mode == "tournament": args.append("-T")
+    elif mode == "broadcast": args.extend(["-b", port])
+    elif mode == "host": args.append(port)
+    elif mode == "connect": args.append("%s:%s" % (address, port))
+    elif mode == "spectate": args.extend(["-s", "%s:%s" % (address, port)])
+    elif mode == "raw": args.extend(raw_args)
+    return args
 
 # returns a list of errors if requirements are not met
 # most important is backend, since we want to test spawn, popen and both
-def check_requirements(wine_cmd: str, caster_exe: str, cwd: str, backend: str) -> List[str]:
+def check_requirements(wine_cmd: str, caster_exe: str, cwd: str, launch_mode: str) -> List[str]:
     errors = []
     if not shutil.which(wine_cmd): errors.append("Wine not in PATH: %s" % wine_cmd)
     if not os.path.isfile(os.path.join(cwd, caster_exe)): errors.append("cccaster not found: %s" % os.path.join(cwd, caster_exe))
-    if backend in ("spawn", "both"):
+    if launch_mode == "spawn":
         try: import pexpect
-        except ImportError: errors.append("Missing dependency spawn")
-    if backend in ("popen", "both"):
+        except ImportError: errors.append("Missing dependency pexpect (for spawn backend)")
+    if launch_mode == "popen":
         try: from pexpect.popen_spawn import PopenSpawn
-        except ImportError: errors.append("Missing dependency popen")
+        except ImportError: errors.append("Missing dependency pexpect.popen_spawn (for popen backend)")
     try: import psutil
     except ImportError: errors.append("Missing dependency psutil")
     return errors
@@ -338,6 +370,68 @@ def test_popen_backend(argv: Sequence[str], cwd: str, env: Dict[str, str], logs_
     write_log(summary_log, "success=%r\n" % success)
     return success
 
+# test subprocess.Popen (arg support)
+def test_subprocess_backend(argv: Sequence[str], cwd: str, env: Dict[str, str], logs_dir: str, read_seconds: float) -> bool:
+    import psutil
+    raw_log = os.path.join(logs_dir, "subprocess-raw.log")
+    summary_log = os.path.join(logs_dir, "subprocess-summary.log")
+    write_log(summary_log, "SUBPROCESS \nargv=%r\ncwd=%r\n" % (list(argv), cwd))
+
+    proc = None
+    success = False
+    try:
+        # use a pipe for stdout/stderr
+        proc = subprocess.Popen(
+            list(argv),
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1 # buffer possible?
+        )
+        write_log(summary_log, "spawned pid=%r\n" % proc.pid)
+
+        # monitor loop
+        deadline = time.time() + read_seconds
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                write_log(summary_log, "process exited with code %r\n" % proc.returncode)
+                break
+
+            # log children
+            try:
+                p = psutil.Process(proc.pid)
+                children = p.children(recursive=True)
+                if children: write_log(summary_log, "active children: %s\n" % [c.pid for c in children])
+            except psutil.Error:
+                pass
+
+            time.sleep(1.0)
+
+        success = True
+    except Exception as exc:
+        write_log(summary_log, "error=%r\n" % exc)
+        success = False
+    finally:
+        if proc and proc.poll() is None:
+            write_log(summary_log, "terminating process tree\n")
+            try:
+                # kill everything
+                p = psutil.Process(proc.pid)
+                for child in p.children(recursive=True):
+                    child.terminate()
+                p.terminate()
+                gone, alive = psutil.wait_procs(p.children() + [p], timeout=3)
+                for a in alive: a.kill()
+            except psutil.Error:
+                proc.terminate()
+
+    return success
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Test linux native caster hook from outside wine")
     parser.add_argument("--cwd", default=os.getcwd(), help="Folder containing caster and melty. Default: current directory")
@@ -345,12 +439,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wine-prefix", default=None, help="Optional WINEPREFIX path")
     parser.add_argument("--wine-debug", default="-all", help="WINEDEBUG value. Default: -all. Use empty string to inherit/noise")
     parser.add_argument("--caster-exe", default="cccaster.v3.1.exe", help="Caster executable. Default: cccaster.v3.1.exe")
-    parser.add_argument("--backend", choices=["spawn", "popen", "both"], default="both", help="Which backend to test. Default: both")
-    parser.add_argument("--send-key", default="0", help="Single key(string) to send after read. Default: 0. --no-send to disable")
+
+    # launch options
+    parser.add_argument("--launch-mode", choices=["subprocess", "spawn", "popen", "wine", "wine-no-fork", "wineconsole-no-fork"], default="subprocess", help="Launch strategy. Default: subprocess")
+    parser.add_argument("--caster-mode", choices=["offline-training", "offline-versus", "tournament", "broadcast", "host", "connect", "spectate", "raw"], default="raw", help="CCCaster mode. Default: raw")
+    parser.add_argument("--port", default="12345", help="Port for network modes")
+    parser.add_argument("--address", default="127.0.0.1", help="Address for connect/spectate")
+    parser.add_argument("--no-ui", action="store_true", help="Pass -n/--no-ui to CCCaster")
+    parser.add_argument("--no-fork", action="store_true", help="Pass --no-fork to CCCaster")
+
+    parser.add_argument("--send-key", default="0", help="Single key(string) to send after read (only for spawn/popen). Default: 0. --no-send to disable")
     parser.add_argument("--no-send", action="store_true", help="Don't send input to caster")
-    parser.add_argument("--read-seconds", type=float, default=3.0, help="Read how many seconds before and after sending input. Default: 3.0.")
+    parser.add_argument("--read-seconds", type=float, default=5.0, help="Read how many seconds to monitor. Default: 5.0.")
     parser.add_argument("--log-dir", default=None, help="Log dir. Default: tools/test-logs/<timestamp>")
-    parser.add_argument("caster_args", nargs="*", help="Extra args passed to caster after the executable")
+    parser.add_argument("caster_args", nargs="*", help="Extra args passed to caster after the executable (used if caster-mode is raw)")
     return parser.parse_args()
 
 if __name__ == "__main__": raise SystemExit(main())
